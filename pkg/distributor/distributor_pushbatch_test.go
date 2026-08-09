@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/ring/client"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -77,21 +79,50 @@ func (p *probeSegmentWriter) Push(_ context.Context, req *segmentwriterv1.PushRe
 // to the segment-writer probe (synchronous fast path), with the fan-out bounded
 // to maxConcurrency.
 func newProbeDistributor(t *testing.T, sw SegmentWriterClient, maxConcurrency int) *Distributor {
+	return newProbeDistributorWithLimits(t, sw, maxConcurrency, 0, false)
+}
+
+func newProbeDistributorWithLimits(t *testing.T, sw SegmentWriterClient, maxConcurrency int, maxInflightBytes int64, asyncIngest bool) *Distributor {
+	return newProbeDistributorWithWritePath(t, sw, maxConcurrency, maxInflightBytes, asyncIngest, writepath.SegmentWriterPath)
+}
+
+func newProbeDistributorWithWritePath(t *testing.T, sw SegmentWriterClient, maxConcurrency int, maxInflightBytes int64, asyncIngest bool, path writepath.WritePath) *Distributor {
 	t.Helper()
 	overrides := validation.MockOverrides(func(defaults *validation.Limits, tenantLimits map[string]*validation.Limits) {
 		l := validation.MockDefaultLimits()
-		l.WritePathOverrides.WritePath = writepath.SegmentWriterPath
+		l.WritePathOverrides.WritePath = path
+		l.WritePathOverrides.AsyncIngest = asyncIngest
 		l.PushMaxConcurrency = maxConcurrency
 		tenantLimits["user-1"] = l
 	})
 	d, err := New(
-		Config{DistributorRing: ringConfig},
+		Config{DistributorRing: ringConfig, SegmentWriterMaxInflightBytes: maxInflightBytes},
 		testhelper.NewMockRing([]ring.InstanceDesc{{Addr: "foo"}}, 3),
 		&poolFactory{f: func(addr string) (client.PoolClient, error) { return newFakeIngester(t, false), nil }},
 		overrides, nil, log.NewNopLogger(), sw,
 	)
 	require.NoError(t, err)
 	return d
+}
+
+type inflightBytesSegmentWriter struct {
+	d                *Distributor
+	started          chan *segmentwriterv1.PushRequest
+	release          chan struct{}
+	observedInflight atomic.Int64
+	pushed           atomic.Int64
+}
+
+func (w *inflightBytesSegmentWriter) CheckReady(context.Context) error { return nil }
+
+func (w *inflightBytesSegmentWriter) Push(_ context.Context, req *segmentwriterv1.PushRequest) (*segmentwriterv1.PushResponse, error) {
+	w.pushed.Add(1)
+	w.observedInflight.Store(w.d.segmentWriterInflightBytes.Load())
+	w.started <- req
+	if w.release != nil {
+		<-w.release
+	}
+	return &segmentwriterv1.PushResponse{}, nil
 }
 
 // probeProfileSeries builds n distinct-label series, each carrying a minimal
@@ -168,6 +199,80 @@ func TestPushBatch_LimitZeroUnbounded(t *testing.T) {
 	const n = 16
 	probe := runPushBatchProbe(t, 0, n)
 	assert.Equal(t, int64(n), probe.pushed.Load(), "all series must complete (no SetLimit(0) deadlock)")
+}
+
+func TestSegmentWriterInflightBytes_Synchronous(t *testing.T) {
+	writer := &inflightBytesSegmentWriter{started: make(chan *segmentwriterv1.PushRequest, 1)}
+	d := newProbeDistributorWithLimits(t, writer, 1, 1<<20, false)
+	writer.d = d
+
+	err := d.PushBatch(tenant.InjectTenantID(context.Background(), "user-1"), &distributormodel.PushRequest{
+		RawProfileType: distributormodel.RawProfileTypePPROF,
+		Series:         probeProfileSeries(1),
+	})
+	require.NoError(t, err)
+	written := <-writer.started
+	require.Equal(t, int64(written.SizeVT()), writer.observedInflight.Load())
+	require.Zero(t, d.segmentWriterInflightBytes.Load())
+	require.Zero(t, testutil.ToFloat64(d.metrics.segmentWriterInflightBytes))
+}
+
+func TestSegmentWriterInflightBytes_RejectsBeforePush(t *testing.T) {
+	writer := &inflightBytesSegmentWriter{started: make(chan *segmentwriterv1.PushRequest, 1)}
+	d := newProbeDistributorWithLimits(t, writer, 1, 1, false)
+	writer.d = d
+
+	err := d.PushBatch(tenant.InjectTenantID(context.Background(), "user-1"), &distributormodel.PushRequest{
+		RawProfileType: distributormodel.RawProfileTypePPROF,
+		Series:         probeProfileSeries(1),
+	})
+	require.Error(t, err)
+	require.Equal(t, connect.CodeUnavailable, connect.CodeOf(err))
+	require.Zero(t, writer.pushed.Load())
+	require.Zero(t, d.segmentWriterInflightBytes.Load())
+	require.Zero(t, testutil.ToFloat64(d.metrics.segmentWriterInflightBytes))
+	require.Equal(t, float64(1), testutil.ToFloat64(d.metrics.segmentWriterInflightBytesRejectedTotal))
+}
+
+func TestSegmentWriterInflightBytes_DoesNotAffectIngesterPath(t *testing.T) {
+	writer := &inflightBytesSegmentWriter{started: make(chan *segmentwriterv1.PushRequest, 1)}
+	d := newProbeDistributorWithWritePath(t, writer, 1, 1, false, writepath.IngesterPath)
+	writer.d = d
+
+	err := d.PushBatch(tenant.InjectTenantID(context.Background(), "user-1"), &distributormodel.PushRequest{
+		RawProfileType: distributormodel.RawProfileTypePPROF,
+		Series:         probeProfileSeries(1),
+	})
+	require.NoError(t, err)
+	require.Zero(t, writer.pushed.Load())
+	require.Zero(t, d.segmentWriterInflightBytes.Load())
+	require.Zero(t, testutil.ToFloat64(d.metrics.segmentWriterInflightBytes))
+	require.Zero(t, testutil.ToFloat64(d.metrics.segmentWriterInflightBytesRejectedTotal))
+}
+
+func TestSegmentWriterInflightBytes_Asynchronous(t *testing.T) {
+	writer := &inflightBytesSegmentWriter{
+		started: make(chan *segmentwriterv1.PushRequest, 1),
+		release: make(chan struct{}),
+	}
+	d := newProbeDistributorWithLimits(t, writer, 1, 1<<20, true)
+	writer.d = d
+
+	err := d.PushBatch(tenant.InjectTenantID(context.Background(), "user-1"), &distributormodel.PushRequest{
+		RawProfileType: distributormodel.RawProfileTypePPROF,
+		Series:         probeProfileSeries(1),
+	})
+	require.NoError(t, err)
+	written := <-writer.started
+	require.Equal(t, int64(written.SizeVT()), writer.observedInflight.Load())
+	require.Equal(t, int64(written.SizeVT()), d.segmentWriterInflightBytes.Load())
+	require.Equal(t, float64(written.SizeVT()), testutil.ToFloat64(d.metrics.segmentWriterInflightBytes))
+
+	close(writer.release)
+	require.Eventually(t, func() bool {
+		return d.segmentWriterInflightBytes.Load() == 0 &&
+			testutil.ToFloat64(d.metrics.segmentWriterInflightBytes) == 0
+	}, time.Second, time.Millisecond)
 }
 
 // TestPushBatch_AggregatesAllErrors: every failing series is attempted and its

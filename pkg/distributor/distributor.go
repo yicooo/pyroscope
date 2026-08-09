@@ -78,10 +78,18 @@ const (
 	ProfileName = "__name__"
 )
 
+var errServiceUnavailableSegmentWriterMaxLoad = connect.NewError(
+	connect.CodeUnavailable,
+	errors.New("distributor segment-writer maximum inflight bytes limit reached"),
+)
+
 // Config for a Distributor.
 type Config struct {
 	PushTimeout time.Duration
 	PoolConfig  clientpool.PoolConfig `yaml:"pool_config,omitempty"`
+
+	// TODO: Does naming make sense and if order affect memory alignmnent.
+	SegmentWriterMaxInflightBytes int64 `yaml:"segment_writer_max_inflight_bytes"`
 
 	// Distributors ring
 	DistributorRing util.CommonRingConfig `yaml:"ring"`
@@ -92,6 +100,7 @@ func (cfg *Config) RegisterFlags(fs *flag.FlagSet, logger log.Logger) {
 	cfg.PoolConfig.RegisterFlagsWithPrefix("distributor", fs)
 	fs.DurationVar(&cfg.PushTimeout, "distributor.push.timeout", 5*time.Second, "Timeout when pushing data to ingester.")
 	cfg.DistributorRing.RegisterFlags("distributor.ring.", "collectors/", "distributors", fs, logger)
+	fs.Int64Var(&cfg.SegmentWriterMaxInflightBytes, "distributor.segment-writer.max-inflight-bytes", 0, "Maximum total serialized bytes in in-flight segment-writer push requests. 0 disables the limit.")
 }
 
 // Distributor coordinates replicates and distribution of log streams.
@@ -128,8 +137,9 @@ type Distributor struct {
 	profileScopeStats       *usagestats.MultiCounter
 	profileSizeStats        *usagestats.MultiStatistics
 
-	router        *writepath.Router
-	segmentWriter SegmentWriterClient
+	router                     *writepath.Router
+	segmentWriter              SegmentWriterClient
+	segmentWriterInflightBytes atomic.Int64
 }
 
 type Limits interface {
@@ -931,6 +941,19 @@ func (d *Distributor) sendRequestsToSegmentWriter(ctx context.Context, req *dist
 			Annotations: s.Annotations,
 		})
 	}
+	var requestSize int64
+	for _, request := range requests {
+		requestSize += int64(request.SizeVT())
+	}
+	newInflightBytes := d.segmentWriterInflightBytes.Add(requestSize)
+	if d.cfg.SegmentWriterMaxInflightBytes > 0 && newInflightBytes > d.cfg.SegmentWriterMaxInflightBytes {
+		d.segmentWriterInflightBytes.Add(-requestSize)
+		d.metrics.segmentWriterInflightBytesRejectedTotal.Inc()
+		return nil, errServiceUnavailableSegmentWriterMaxLoad
+	}
+	d.metrics.segmentWriterInflightBytes.Add(float64(requestSize))
+	defer d.metrics.segmentWriterInflightBytes.Sub(float64(requestSize))
+	defer d.segmentWriterInflightBytes.Add(-requestSize)
 
 	if len(requests) == 1 {
 		if _, err := d.segmentWriter.Push(ctx, requests[0]); err != nil {

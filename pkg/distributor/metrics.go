@@ -32,16 +32,18 @@ var allStages = fmt.Sprintf("%s, %s, %s",
 )
 
 type metrics struct {
-	receivedCompressedBytes        *prometheus.HistogramVec
-	receivedDecompressedBytes      *prometheus.HistogramVec // deprecated TODO remove
-	receivedSamples                *prometheus.HistogramVec
-	receivedSamplesBytes           *prometheus.HistogramVec
-	receivedSymbolsBytes           *prometheus.HistogramVec
-	replicationFactor              prometheus.Gauge
-	receivedDecompressedBytesTotal *prometheus.HistogramVec
-	profilesReceived               *prometheus.CounterVec
-	parseDuration                  *prometheus.HistogramVec
-	pushBatchSeries                *prometheus.HistogramVec
+	receivedCompressedBytes                 *prometheus.HistogramVec
+	receivedDecompressedBytes               *prometheus.HistogramVec // deprecated TODO remove
+	receivedSamples                         *prometheus.HistogramVec
+	receivedSamplesBytes                    *prometheus.HistogramVec
+	receivedSymbolsBytes                    *prometheus.HistogramVec
+	replicationFactor                       prometheus.Gauge
+	receivedDecompressedBytesTotal          *prometheus.HistogramVec
+	profilesReceived                        *prometheus.CounterVec
+	parseDuration                           *prometheus.HistogramVec
+	pushBatchSeries                         *prometheus.HistogramVec
+	segmentWriterInflightBytes              prometheus.Gauge
+	segmentWriterInflightBytesRejectedTotal prometheus.Counter
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -161,6 +163,18 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			},
 			[]string{"tenant"},
 		),
+		segmentWriterInflightBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "pyroscope",
+			Subsystem: "distributor",
+			Name:      "segment_writer_inflight_bytes",
+			Help:      "Current serialized size of in-flight segment-writer push requests.",
+		}),
+		segmentWriterInflightBytesRejectedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "pyroscope",
+			Subsystem: "distributor",
+			Name:      "segment_writer_inflight_bytes_rejected_total",
+			Help:      "Total number of segment-writer push requests rejected because the distributor exceeded its inflight bytes limit.",
+		}),
 	}
 	if reg != nil {
 		reg.MustRegister(
@@ -174,6 +188,8 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			m.profilesReceived,
 			m.parseDuration,
 			m.pushBatchSeries,
+			m.segmentWriterInflightBytes,
+			m.segmentWriterInflightBytesRejectedTotal,
 		)
 	}
 	return m

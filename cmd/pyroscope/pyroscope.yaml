@@ -262,6 +262,10 @@ distributor:
   # Timeout when pushing data to ingester.
   # pushtimeout: 5s
 
+  # Maximum total serialized bytes in in-flight segment-writer push requests. 0
+  # disables the limit.
+  # segment_writer_max_inflight_bytes: 0
+
   pool_config:
     # How frequently to clean up clients for ingesters that have gone away.
     # client_cleanup_period: 15s

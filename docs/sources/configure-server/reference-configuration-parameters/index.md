@@ -717,6 +717,11 @@ The `distributor` block configures the distributor.
 # CLI flag: -distributor.push.timeout
 [pushtimeout: <duration> | default = 5s]
 
+# Maximum total serialized bytes in in-flight segment-writer push requests. 0
+# disables the limit.
+# CLI flag: -distributor.segment-writer.max-inflight-bytes
+[segment_writer_max_inflight_bytes: <int> | default = 0]
+
 pool_config:
   # How frequently to clean up clients for ingesters that have gone away.
   # CLI flag: -distributor.client-cleanup-period
